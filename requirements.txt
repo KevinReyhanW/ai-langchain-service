@@ -1,9 +1,9 @@
 fastapi
 uvicorn
 langchain
-langchain-community
 langchain-openai
-langchain-text-splitters
+langchain-community
 faiss-cpu
-openai
+tiktoken
 python-dotenv
+pydantic

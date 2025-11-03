@@ -1,58 +1,118 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.chains import RetrievalQA
+from dotenv import load_dotenv
 import os
+import logging
 
 app = FastAPI()
 
-# ✅ Load environment variable for your OpenAI key
+# ✅ Load .env
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+print("Loaded OPENAI_API_KEY prefix:", OPENAI_API_KEY[:100])
 
-# ✅ Basic text generation model
-llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model="gpt-3.5-turbo")
+if not OPENAI_API_KEY:
+    raise ValueError("Missing OPENAI_API_KEY — please add it to your environment or .env file")
 
-# ✅ Load and prepare local document
-with open("sample.txt", "r", encoding="utf-8") as f:
-    document = f.read()
+# ✅ Initialize LLM safely
+try:
+    llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model="gpt-4o-mini")
+except Exception as e:
+    llm = None
+    logging.warning("⚠️ Could not initialize ChatOpenAI: %s", e)
 
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-chunks = text_splitter.split_text(document)
+# ✅ Load sample document
+try:
+    with open("sample.txt", "r", encoding="utf-8") as f:
+        document = f.read()
+except FileNotFoundError:
+    document = "This is a placeholder document since sample.txt was not found."
 
-embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-vectorstore = FAISS.from_texts(chunks, embeddings)
-retriever = vectorstore.as_retriever()
+# ✅ Text chunk splitter (simple fallback)
+def split_text_into_chunks(text: str, chunk_size: int = 800, chunk_overlap: int = 100):
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - chunk_overlap
+    return chunks
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    chain_type="stuff"
-)
+chunks = split_text_into_chunks(document)
 
-# ✅ Pydantic models
+# ✅ Safe FAISS vectorstore creation
+vectorstore = None
+try:
+    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+    vectorstore = FAISS.from_texts(chunks, embeddings)
+except Exception as e:
+    logging.warning("⚠️ Could not create FAISS vectorstore: %s", e)
+    vectorstore = None
+
+
+# ✅ Simple fallback retriever
+def _normalize(text: str):
+    return [t for t in ''.join(c.lower() if c.isalnum() else ' ' for c in text).split() if t]
+
+def get_top_chunks(question: str, k: int = 3):
+    q_tokens = _normalize(question)
+    if not q_tokens:
+        return []
+    q_set = set(q_tokens)
+    scored = []
+    for idx, chunk in enumerate(chunks):
+        c_tokens = _normalize(chunk)
+        score = len(q_set.intersection(c_tokens))
+        scored.append((score, chunk))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for s, c in scored[:k] if s > 0]
+
+
+# ✅ Request Models
 class AskRequest(BaseModel):
     question: str
 
 class GenerateRequest(BaseModel):
     prompt: str
 
+
 # ✅ Routes
 @app.get("/")
 def root():
-    return {"message": "AI LangChain Service is running"}
+    return {"message": "✅ AI LangChain Service is running. Use POST /ask or POST /generate."}
+
 
 @app.post("/ask")
-async def ask_question(req: AskRequest):
+async def ask(req: AskRequest):
     try:
-        result = qa_chain.run(req.question)
-        return {"answer": result}
+        # Try FAISS retrieval
+        if vectorstore:
+            try:
+                docs = vectorstore.similarity_search(req.question, k=3)
+                chunks_out = [getattr(d, "page_content", str(d)) for d in docs if d]
+                if chunks_out:
+                    return {"method": "vectorstore", "chunks": chunks_out}
+            except Exception as e:
+                logging.warning("⚠️ FAISS similarity search failed: %s", e)
+
+        # Fallback local search
+        top = get_top_chunks(req.question)
+        if not top:
+            return {"method": "fallback", "answer": "No relevant context found."}
+        return {"method": "fallback", "chunks": top}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/generate")
-async def generate_text(req: GenerateRequest):
+async def generate(req: GenerateRequest):
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM not initialized (check API key or quota).")
     try:
         response = llm.invoke(req.prompt)
         return {"response": response.content}
