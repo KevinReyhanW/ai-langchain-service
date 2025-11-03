@@ -25,7 +25,7 @@ if not OPENAI_API_KEY:
 # -----------------------------
 origins = [
     "http://localhost:3000",  # local Next.js frontend
-    "https://your-vercel-app.vercel.app",  # deployed frontend
+    "https://ai-langchain-frontend.vercel.app",  # deployed frontend
 ]
 
 app.add_middleware(
